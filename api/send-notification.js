@@ -5,16 +5,7 @@ const cors = require("cors");
 
 const app = express();
 app.use(bodyParser.json());
-app.use(
-  cors({
-    origin: "*", // Pour le développement, vous pouvez restreindre cela plus tard si nécessaire
-    methods: ["POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type"],
-  })
-);
-
-// Gérer explicitement les requêtes preflight OPTIONS
-app.options("/api/send-notification", cors());
+app.use(cors({ origin: '*' }));
 
 // Note : Les informations de serviceAccountKey seront stockées dans les variables d'environnement de Vercel
 if (!admin.apps.length) {
@@ -31,7 +22,7 @@ if (!admin.apps.length) {
 
 const db = admin.firestore();
 
-app.post("/api/send-notification", async (req, res) => {
+app.post("/", async (req, res) => {
   const { appName, title, body, recipient } = req.body;
 
   if (!title || !body || !recipient) {

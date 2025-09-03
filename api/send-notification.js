@@ -1,140 +1,98 @@
-const express = require("express");
-const admin = require("firebase-admin");
-const bodyParser = require("body-parser");
-const cors = require("cors");
+const admin = require('firebase-admin');
 
-const app = express();
-app.use(bodyParser.json());
-app.use(cors({ origin: '*' }));
-
-let adminApp;
-try {
-  if (!admin.apps.length) {
-    const serviceAccountB64 = process.env.GOOGLE_APPLICATION_CREDENTIALS_BASE64;
-    if (!serviceAccountB64) {
-      throw new Error('GOOGLE_APPLICATION_CREDENTIALS_BASE64 environment variable is not set.');
+// Fonction pour initialiser Firebase Admin SDK en toute sécurité
+function initializeFirebaseAdmin() {
+    try {
+        if (admin.apps.length) {
+            return admin.app();
+        }
+        const serviceAccountJSON = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
+        if (!serviceAccountJSON) {
+            throw new Error('Variable d\'environnement GOOGLE_SERVICE_ACCOUNT_JSON non définie.');
+        }
+        const serviceAccount = JSON.parse(serviceAccountJSON);
+        return admin.initializeApp({
+            credential: admin.credential.cert(serviceAccount)
+        });
+    } catch (e) {
+        console.error('CRITIQUE: Échec de l\'initialisation du SDK Firebase Admin:', e);
+        return null;
     }
-    const serviceAccount = JSON.parse(Buffer.from(serviceAccountB64, 'base64').toString('ascii'));
-    adminApp = admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount)
-    });
-  } else {
-    adminApp = admin.app();
-  }
-} catch (e) {
-  console.error('Failed to initialize Firebase Admin SDK:', e);
-  adminApp = null; // Indiquer que l'initialisation a échoué
 }
 
-const db = adminApp ? adminApp.firestore() : null;
+const adminApp = initializeFirebaseAdmin();
 
-app.post("/", async (req, res) => {
-  if (!adminApp || !db) {
-    return res.status(500).send({ success: false, message: 'Internal Server Error: Firebase Admin not initialized. Check server logs for configuration errors.' });
-  }
-  const { appName, title, body, recipient } = req.body;
+// La fonction serverless principale
+module.exports = async (req, res) => {
+    // Log d'entrée - C'est le log le plus important à vérifier
+    console.log(`Requête reçue: ${req.method}`);
 
-  if (!title || !body || !recipient) {
-    return res
-      .status(400)
-      .send("Missing parameters: title, body, or recipient are required.");
-  }
+    // Définir manuellement les en-têtes CORS pour chaque requête
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
-  try {
-    let deviceTokens = [];
+    // Gérer la requête preflight OPTIONS
+    if (req.method === 'OPTIONS') {
+        console.log('Réponse à la requête preflight OPTIONS.');
+        return res.status(204).send('');
+    }
 
-    if (recipient === "Tout le monde") {
-      // Envoyer à tous les utilisateurs
-      const usersSnapshot = await db.collection("users").get();
-      usersSnapshot.forEach((doc) => {
-        const userData = doc.data();
-        if (userData.deviceToken) {
-          deviceTokens.push(userData.deviceToken);
+    // Vérifier si Firebase est initialisé
+    if (!adminApp) {
+        console.error('Le SDK Firebase Admin n\'est pas initialisé.');
+        return res.status(500).json({ success: false, message: 'Erreur de configuration du serveur.' });
+    }
+
+    // N'autoriser que les requêtes POST
+    if (req.method !== 'POST') {
+        return res.status(405).json({ success: false, message: 'Méthode non autorisée' });
+    }
+
+    // Parser le corps de la requête manuellement
+    let body = '';
+    req.on('data', chunk => { body += chunk.toString(); });
+    req.on('end', async () => {
+        try {
+            console.log('Corps de la requête reçu:', body);
+            const { appName, title, body: notificationBody, recipient } = JSON.parse(body);
+
+            if (!title || !notificationBody || !recipient) {
+                return res.status(400).json({ success: false, message: 'Paramètres manquants.' });
+            }
+
+            const db = adminApp.firestore();
+            let deviceTokens = [];
+
+            if (recipient === 'Tout le monde') {
+                const usersSnapshot = await db.collection('users').get();
+                usersSnapshot.forEach(doc => {
+                    const userData = doc.data();
+                    if (userData.deviceToken) deviceTokens.push(userData.deviceToken);
+                });
+            } else {
+                const snapshot = await db.collection('users').where('email', '==', recipient).limit(1).get();
+                if (!snapshot.empty) {
+                    const userData = snapshot.docs[0].data();
+                    if (userData.deviceToken) deviceTokens.push(userData.deviceToken);
+                }
+            }
+
+            if (deviceTokens.length === 0) {
+                return res.status(404).json({ success: false, message: 'Aucun deviceToken trouvé.' });
+            }
+
+            const message = {
+                notification: { title: `${appName} - ${title}`, body: notificationBody },
+                tokens: deviceTokens,
+            };
+
+            await admin.messaging().sendEachForMulticast(message);
+            return res.status(200).json({ success: true, message: 'Notification envoyée avec succès.' });
+
+        } catch (error) {
+            console.error('Erreur lors du traitement de la requête:', error);
+            return res.status(500).json({ success: false, message: 'Erreur interne du serveur.' });
         }
-      });
-    } else {
-      // Envoyer à une institution spécifique par email
-      const usersRef = db.collection("users");
-      const snapshot = await usersRef
-        .where("email", "==", recipient)
-        .limit(1)
-        .get();
-      if (snapshot.empty) {
-        return res.status(404).send("Recipient not found.");
-      }
-      snapshot.forEach((doc) => {
-        const userData = doc.data();
-        if (userData.deviceToken) {
-          deviceTokens.push(userData.deviceToken);
-        }
-      });
-    }
-
-    if (deviceTokens.length === 0) {
-      return res
-        .status(404)
-        .send("No device tokens found for the specified recipient(s).");
-    }
-
-    const message = {
-      notification: {
-        title: `${appName} - ${title}`,
-        body: body,
-      },
-      tokens: deviceTokens,
-    };
-
-    const response = await admin.messaging().sendEachForMulticast(message);
-    console.log("Successfully sent message:", response);
-
-    // Nettoyer les tokens invalides
-    await cleanupInvalidTokens(response.responses, deviceTokens);
-
-    res
-      .status(200)
-      .send({
-        success: true,
-        message: "Notifications sent successfully!",
-        response,
-      });
-  } catch (error) {
-    console.error("Error sending notification:", error);
-    res.status(500).send("Error sending notification.");
-  }
-});
-
-async function cleanupInvalidTokens(responses, tokens) {
-  const invalidTokens = [];
-  responses.forEach((response, index) => {
-    if (!response.success) {
-      const errorCode = response.error.code;
-      if (
-        errorCode === "messaging/invalid-registration-token" ||
-        errorCode === "messaging/registration-token-not-registered"
-      ) {
-        invalidTokens.push(tokens[index]);
-      }
-    }
-  });
-
-  if (invalidTokens.length > 0) {
-    console.log("List of invalid tokens to remove: ", invalidTokens);
-    const usersRef = db.collection("users");
-    const snapshot = await usersRef
-      .where("deviceToken", "in", invalidTokens)
-      .get();
-
-    const batch = db.batch();
-    snapshot.forEach((doc) => {
-      console.log(`Removing token from user ${doc.id}`);
-      batch.update(doc.ref, {
-        deviceToken: admin.firestore.FieldValue.delete(),
-      });
     });
-    await batch.commit();
-  }
-}
-
-// Exporter l'application pour Vercel
-module.exports = app;
-("");
+};

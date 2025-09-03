@@ -7,22 +7,31 @@ const app = express();
 app.use(bodyParser.json());
 app.use(cors({ origin: '*' }));
 
-// Note : Les informations de serviceAccountKey seront stockées dans les variables d'environnement de Vercel
-if (!admin.apps.length) {
-  const serviceAccount = JSON.parse(
-    Buffer.from(
-      process.env.GOOGLE_APPLICATION_CREDENTIALS_BASE64,
-      "base64"
-    ).toString("ascii")
-  );
-  admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount),
-  });
+let adminApp;
+try {
+  if (!admin.apps.length) {
+    const serviceAccountB64 = process.env.GOOGLE_APPLICATION_CREDENTIALS_BASE64;
+    if (!serviceAccountB64) {
+      throw new Error('GOOGLE_APPLICATION_CREDENTIALS_BASE64 environment variable is not set.');
+    }
+    const serviceAccount = JSON.parse(Buffer.from(serviceAccountB64, 'base64').toString('ascii'));
+    adminApp = admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount)
+    });
+  } else {
+    adminApp = admin.app();
+  }
+} catch (e) {
+  console.error('Failed to initialize Firebase Admin SDK:', e);
+  adminApp = null; // Indiquer que l'initialisation a échoué
 }
 
-const db = admin.firestore();
+const db = adminApp ? adminApp.firestore() : null;
 
 app.post("/", async (req, res) => {
+  if (!adminApp || !db) {
+    return res.status(500).send({ success: false, message: 'Internal Server Error: Firebase Admin not initialized. Check server logs for configuration errors.' });
+  }
   const { appName, title, body, recipient } = req.body;
 
   if (!title || !body || !recipient) {
